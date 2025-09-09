@@ -15,11 +15,19 @@ app.post("/create-patreon-post", async (req, res) => {
   let browser;
   try {
     browser = await chromium.launch({
-      args: ["--no-sandbox", "--disable-dev-shm-usage"],
-      headless: true
+      headless: true,
+      args: ["--no-sandbox", "--disable-dev-shm-usage"]
     });
-    const context = await browser.newContext();
 
+    const context = await browser.newContext({
+      // a normal Chrome UA helps reduce anti-bot hiccups
+      userAgent:
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+      viewport: { width: 1366, height: 768 }
+    });
+    context.setDefaultTimeout(60000); // default waits up to 60s
+
+    // Use session cookie if provided (best for 2FA)
     if (SESSION_COOKIE) {
       const cookiePairs = SESSION_COOKIE.split(";").map(s => s.trim()).filter(Boolean);
       const cookies = cookiePairs.map(kv => {
@@ -30,57 +38,143 @@ app.post("/create-patreon-post", async (req, res) => {
     }
 
     const page = await context.newPage();
-    await page.goto("https://www.patreon.com/home", { waitUntil: "domcontentloaded" });
 
-    const needsLogin = await page.locator('text=Log in').first().isVisible().catch(() => false);
-    if (needsLogin) {
+    // Helper: dismiss cookie banner if it appears
+    const dismissCookieBanner = async () => {
+      try {
+        // OneTrust style
+        const onetrust = page.locator("#onetrust-accept-btn-handler");
+        if (await onetrust.isVisible({ timeout: 2000 }).catch(() => false)) {
+          await onetrust.click();
+        }
+        // Generic “Accept all cookies”
+        const acceptAll = page.getByRole("button", { name: /accept all/i });
+        if (await acceptAll.isVisible({ timeout: 2000 }).catch(() => false)) {
+          await acceptAll.click();
+        }
+      } catch {}
+    };
+
+    // 1) Go to home (more reliable entry)
+    await page.goto("https://www.patreon.com/home", { waitUntil: "domcontentloaded", timeout: 90000 });
+    await dismissCookieBanner();
+
+    // 2) If not logged in, log in (only if EMAIL/PASSWORD provided)
+    const loginLinkVisible = await page.getByRole("link", { name: /log in/i }).first().isVisible().catch(() => false);
+    if (loginLinkVisible) {
       if (!EMAIL || !PASSWORD) {
         throw new Error("Not logged in and no credentials provided. Set PATREON_SESSION_COOKIE or PATREON_EMAIL+PATREON_PASSWORD.");
       }
-      await page.goto("https://www.patreon.com/login", { waitUntil: "domcontentloaded" });
-      await page.fill('input[type="email"]', EMAIL);
-      await page.fill('input[type="password"]', PASSWORD);
+      await page.goto("https://www.patreon.com/login", { waitUntil: "domcontentloaded", timeout: 90000 });
+      await dismissCookieBanner();
+      await page.fill('input[type="email"]', EMAIL, { timeout: 60000 });
+      await page.fill('input[type="password"]', PASSWORD, { timeout: 60000 });
       await Promise.all([
-        page.waitForNavigation({ waitUntil: "networkidle" }),
+        page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 90000 }),
         page.click('button[type="submit"]')
       ]);
+      // Back to home to stabilise session
+      await page.goto("https://www.patreon.com/home", { waitUntil: "domcontentloaded", timeout: 90000 });
     }
 
-    await page.goto("https://www.patreon.com/posts/new?type=text", { waitUntil: "networkidle" });
+    // 3) Open the text post composer (use domcontentloaded, not networkidle)
+    // Try direct route first
+    const composerUrls = [
+      "https://www.patreon.com/posts/new?type=text",
+      "https://www.patreon.com/posts/new"
+    ];
+    let composerLoaded = false;
+    for (const url of composerUrls) {
+      try {
+        await page.goto(url, { waitUntil: "domcontentloaded", timeout: 90000 });
+        await dismissCookieBanner();
+        // Wait for any of the known title/body selectors
+        const titleSel = page.locator(
+          [
+            '[data-testid="post-title-input"]',
+            'textarea[aria-label="Title"]',
+            'input[placeholder*="Title"]',
+            '[contenteditable="true"]'
+          ].join(", ")
+        );
+        const bodySel = page.locator(
+          [
+            '[data-testid="post-body-editor"]',
+            'div[role="textbox"][contenteditable="true"]',
+            'textarea[aria-label*="Write"]'
+          ].join(", ")
+        );
 
-    const titleSel = [
+        await Promise.race([
+          titleSel.waitFor({ state: "visible", timeout: 60000 }),
+          bodySel.waitFor({ state: "visible", timeout: 60000 })
+        ]);
+        composerLoaded = true;
+        break;
+      } catch {
+        // try the next URL
+      }
+    }
+
+    if (!composerLoaded) {
+      throw new Error("Could not load the text post composer (timed out waiting for editor).");
+    }
+
+    // 4) Fill title & content
+    const titleCandidates = [
       '[data-testid="post-title-input"]',
       'textarea[aria-label="Title"]',
       'input[placeholder*="Title"]',
       '[contenteditable="true"]'
-    ].join(", ");
-    await page.locator(titleSel).first().click({ timeout: 15000 });
-    await page.keyboard.type(title);
-
-    const contentSel = [
+    ];
+    const bodyCandidates = [
       '[data-testid="post-body-editor"]',
       'div[role="textbox"][contenteditable="true"]',
       'textarea[aria-label*="Write"]'
-    ].join(", ");
-    await page.locator(contentSel).first().click({ timeout: 15000 });
-    await page.keyboard.type(content);
+    ];
 
-    if (visibility !== "public") {
-      const visBtn = page.getByRole("button", { name: /public|patrons/i }).first();
+    const clickAndType = async (selectors, text) => {
+      for (const sel of selectors) {
+        const loc = page.locator(sel).first();
+        if (await loc.isVisible().catch(() => false)) {
+          await loc.click();
+          await page.keyboard.type(text);
+          return true;
+        }
+      }
+      return false;
+    };
+
+    const titleOk = await clickAndType(titleCandidates, title);
+    const bodyOk = await clickAndType(bodyCandidates, content);
+    if (!titleOk || !bodyOk) throw new Error("Could not find title/content fields on the composer.");
+
+    // 5) Visibility (default patrons). Try to switch only if asked public.
+    if (visibility === "public") {
+      const visBtn = page.getByRole("button", { name: /public|patrons|members/i }).first();
       if (await visBtn.isVisible().catch(() => false)) {
         await visBtn.click();
-        const patronsOpt = page.getByRole("option", { name: /patrons only|members/i }).first();
-        if (await patronsOpt.isVisible().catch(() => false)) await patronsOpt.click();
+        const publicOpt = page.getByRole("option", { name: /public/i }).first();
+        if (await publicOpt.isVisible().catch(() => false)) await publicOpt.click();
       }
     }
 
+    // 6) Publish (with generous timeout)
     const publishBtn = page.getByRole("button", { name: /publish/i }).first();
-    await Promise.all([
-      page.waitForLoadState("networkidle"),
-      publishBtn.click({ timeout: 20000 })
-    ]);
+    if (!(await publishBtn.isVisible().catch(() => false))) {
+      // sometimes it's “Post” or similar
+      const postBtn = page.getByRole("button", { name: /post/i }).first();
+      if (await postBtn.isVisible().catch(() => false)) {
+        await Promise.all([page.waitForLoadState("load", { timeout: 90000 }), postBtn.click()]);
+      } else {
+        throw new Error("Publish/Post button not found.");
+      }
+    } else {
+      await Promise.all([page.waitForLoadState("load", { timeout: 90000 }), publishBtn.click()]);
+    }
 
-    await page.waitForURL(/patreon\.com\/posts\//, { timeout: 60000 });
+    // Wait until it lands on the final post URL
+    await page.waitForURL(/patreon\.com\/posts\//, { timeout: 120000 });
     const patreonUrl = page.url();
 
     res.json({ patreonUrl });
