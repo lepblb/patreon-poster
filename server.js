@@ -1,4 +1,4 @@
-// server.js — full replacement
+// server.js (diagnostic build)
 import express from "express";
 import { chromium } from "playwright";
 
@@ -6,13 +6,16 @@ const app = express();
 app.use(express.json({ limit: "1mb" }));
 
 // ===== ENV =====
-const SESSION_COOKIE =
+const RAW_COOKIE =
   process.env.PATREON_SESSION_COOKIE || process.env.PATREON_COOKIE || "";
 const EMAIL = process.env.PATREON_EMAIL || "";
 const PASSWORD = process.env.PATREON_PASSWORD || ""; // only if no 2FA
 const CAMPAIGN_ID = process.env.PATREON_CAMPAIGN_ID || ""; // e.g. "13804237"
+const PORT = process.env.PORT || 8080;
 
-// ===== BROWSER HELPERS =====
+const UA =
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+
 function launchBrowser() {
   return chromium.launch({
     headless: true,
@@ -23,38 +26,38 @@ function launchBrowser() {
 function newContext(browser) {
   return browser.newContext({
     viewport: { width: 1366, height: 768 },
-    userAgent:
-      "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    userAgent: UA,
   });
 }
 
+// --- apply cookie to BOTH domains (critical)
 async function applySessionCookie(context) {
-  if (!SESSION_COOKIE) return { added: 0 };
-  const pairs = SESSION_COOKIE.split(";").map((s) => s.trim()).filter(Boolean);
-  const cookies = pairs
-    .map((kv) => {
-      const i = kv.indexOf("=");
-      if (i < 0) return null;
-      return {
-        name: kv.slice(0, i).trim(),
-        value: kv.slice(i + 1).trim(),
-        domain: ".patreon.com",
-        path: "/",
-      };
-    })
-    .filter(Boolean);
+  if (!RAW_COOKIE) return { added: 0, names: [] };
+  const pairs = RAW_COOKIE.split(";").map((s) => s.trim()).filter(Boolean);
+  const names = [];
+  const cookies = [];
+  for (const kv of pairs) {
+    const i = kv.indexOf("=");
+    if (i < 0) continue;
+    const name = kv.slice(0, i).trim();
+    const value = kv.slice(i + 1).trim();
+    names.push(name);
+    // set for both apex + www
+    cookies.push({ name, value, domain: ".patreon.com", path: "/" });
+    cookies.push({ name, value, domain: "www.patreon.com", path: "/" });
+  }
   if (cookies.length) await context.addCookies(cookies);
-  return { added: cookies.length };
+  return { added: cookies.length, names };
 }
 
 async function dismissBanners(page) {
   try {
-    const ot = page.locator("#onetrust-accept-btn-handler");
-    if (await ot.isVisible({ timeout: 800 }).catch(() => false)) await ot.click();
+    const c = page.locator("#onetrust-accept-btn-handler");
+    if (await c.isVisible({ timeout: 800 }).catch(() => false)) await c.click();
   } catch {}
   try {
-    const accept = page.getByRole("button", { name: /accept all/i }).first();
-    if (await accept.isVisible({ timeout: 800 }).catch(() => false)) await accept.click();
+    const b = page.getByRole("button", { name: /accept all/i }).first();
+    if (await b.isVisible({ timeout: 800 }).catch(() => false)) await b.click();
   } catch {}
 }
 
@@ -86,7 +89,6 @@ async function findEditor(page) {
     'div[role="textbox"][data-slate-editor="true"]',
   ];
 
-  // main frame
   for (const t of titleSel) {
     const tl = page.locator(t).first();
     if (await tl.isVisible().catch(() => false)) {
@@ -97,7 +99,6 @@ async function findEditor(page) {
       return { title: tl, body: null };
     }
   }
-  // iframes
   for (const f of page.frames()) {
     for (const t of titleSel) {
       const tl = f.locator(t).first();
@@ -114,125 +115,75 @@ async function findEditor(page) {
 }
 
 // ===== DEBUG ROUTES =====
+app.get("/diag", (_req, res) => {
+  const preview = RAW_COOKIE ? `${RAW_COOKIE.slice(0, 48)}...(${RAW_COOKIE.length})` : "";
+  res.json({
+    hasCookieEnv: !!RAW_COOKIE,
+    cookiePreview: preview,
+    campaignId: CAMPAIGN_ID || null,
+  });
+});
+
+app.get("/debug-cookie-load-lite", (_req, res) => {
+  try {
+    const preview = RAW_COOKIE ? `${RAW_COOKIE.slice(0, 48)}...(${RAW_COOKIE.length})` : "";
+    const names = RAW_COOKIE
+      ? RAW_COOKIE.split(";")
+          .map((s) => s.trim())
+          .filter(Boolean)
+          .map((kv) => kv.slice(0, kv.indexOf("=")).trim())
+      : [];
+    res.json({
+      hasEnv: !!RAW_COOKIE,
+      envPreview: preview,
+      parsedCookieNames: names,
+      parsedCount: names.length,
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message || e) });
+  }
+});
+
 app.get("/debug-auth", async (_req, res) => {
   let browser;
+  const trace = [];
   try {
     browser = await launchBrowser();
     const context = await newContext(browser);
-    context.setDefaultTimeout(60000);
-    await applySessionCookie(context);
+    const applied = await applySessionCookie(context);
     const page = await context.newPage();
+
     await page.goto("https://www.patreon.com/home", { waitUntil: "domcontentloaded", timeout: 60000 });
     await dismissBanners(page);
-    const currentUrl = page.url();
-    const title = await page.title().catch(() => "");
-    const loggedIn = !/\/login/.test(currentUrl) && !/log in/i.test(title);
-    res.json({ loggedIn, currentUrl, title, hasCookie: !!SESSION_COOKIE });
+    trace.push({ step: "home", url: page.url(), title: await page.title().catch(() => "") });
+
+    const loggedIn = !/\/login/.test(page.url());
+    res.json({ loggedIn, currentUrl: page.url(), title: await page.title().catch(() => ""), cookieApplied: applied, trace });
   } catch (e) {
-    res.status(500).json({ error: String(e?.message || e) });
+    res.status(500).json({ error: String(e?.message || e), trace });
   } finally {
     try { await browser?.close(); } catch {}
   }
 });
 
-app.get("/debug-cookie-load-lite", (req, res) => {
-  try {
-    const raw = SESSION_COOKIE;
-    const envPreview = raw ? `${raw.slice(0, 48)}...(${raw.length})` : "";
-    const pairs = raw.split(";").map((s) => s.trim()).filter(Boolean);
-    const names = pairs
-      .map((kv) => {
-        const i = kv.indexOf("="); if (i < 0) return null;
-        return kv.slice(0, i).trim();
-      })
-      .filter(Boolean);
-    res.json({
-      hasEnv: !!raw,
-      envPreview,
-      parsedCookieNames: names.slice(0, 30),
-      parsedCount: names.length,
-      note: "No browser launched here; only env parsing.",
-    });
-  } catch (e) {
-    res.status(500).json({ error: String(e?.message || e) });
-  }
-});
-
-app.get("/debug-cookie-load", async (_req, res) => {
+// Try composer only (no post)
+app.get("/try-composer", async (_req, res) => {
   let browser;
+  const trace = [];
   try {
-    const raw = SESSION_COOKIE;
-    const envPreview = raw ? `${raw.slice(0, 48)}...(${raw.length})` : "";
-
-    browser = await chromium.launch({
-      headless: true,
-      args: ["--no-sandbox", "--disable-dev-shm-usage"],
-      timeout: 45000,
-    });
+    browser = await launchBrowser();
     const context = await newContext(browser);
-    const { added } = await applySessionCookie(context);
-    const applied = await context.cookies("https://www.patreon.com").catch(() => []);
-    const cookiesApplied = (applied || []).slice(0, 30).map((c) => ({ name: c.name, domain: c.domain }));
-
+    await applySessionCookie(context);
     const page = await context.newPage();
-    await page.goto("https://www.patreon.com/home", { waitUntil: "domcontentloaded", timeout: 45000 });
-    const currentUrl = page.url();
-    const title = await page.title().catch(() => "");
 
-    res.json({
-      hasEnv: !!raw,
-      envPreview,
-      cookiesAddedFromEnv: added,
-      cookiesAppliedCount: applied?.length || 0,
-      cookiesApplied,
-      currentUrl,
-      title,
-    });
-  } catch (e) {
-    res.status(500).json({ error: String(e?.message || e) });
-  } finally {
-    try { await browser?.close(); } catch {}
-  }
-});
-
-app.get("/warmup", (_req, res) => res.json({ ok: true, ts: Date.now() }));
-
-// ===== CORE: CREATE POST =====
-let busy = false;
-
-async function createPostOnce({ title, content, visibility }) {
-  const browser = await launchBrowser();
-  const context = await newContext(browser);
-  context.setDefaultTimeout(90000);
-  await applySessionCookie(context);
-  const page = await context.newPage();
-
-  try {
-    // Go home, dismiss modals
+    // home
     await page.goto("https://www.patreon.com/home", { waitUntil: "domcontentloaded", timeout: 90000 });
     await dismissBanners(page);
+    trace.push({ step: "home", url: page.url(), title: await page.title().catch(() => "") });
 
-    // If we see login and creds provided, attempt email login (no 2FA)
-    const looksLogin =
-      /\/login/.test(page.url()) || /log in/i.test(await page.title().catch(() => ""));
-    if (looksLogin && EMAIL && PASSWORD) {
-      await page.goto("https://www.patreon.com/login", { waitUntil: "domcontentloaded", timeout: 90000 });
-      await dismissBanners(page);
-      await page.fill('input[type="email"]', EMAIL, { timeout: 60000 });
-      await page.fill('input[type="password"]', PASSWORD, { timeout: 60000 });
-      await Promise.all([
-        page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 90000 }),
-        page.click('button[type="submit"]'),
-      ]);
-    }
-
-    // === Campaign-aware composer navigation ===
+    // targets
     const targets = [
-      CAMPAIGN_ID
-        ? `https://www.patreon.com/posts/new?type=text&campaign_id=${encodeURIComponent(
-            CAMPAIGN_ID
-          )}`
-        : null,
+      CAMPAIGN_ID ? `https://www.patreon.com/posts/new?type=text&campaign_id=${encodeURIComponent(CAMPAIGN_ID)}` : null,
       "https://www.patreon.com/creator-home",
       "https://www.patreon.com/posts/new?type=text",
       "https://www.patreon.com/posts/new",
@@ -240,66 +191,118 @@ async function createPostOnce({ title, content, visibility }) {
 
     let landed = false;
     for (const u of targets) {
-      try {
-        await page.goto(u, { waitUntil: "domcontentloaded", timeout: 90000 });
-        await dismissBanners(page);
-        if (/\/login/.test(page.url())) continue; // bounced → try next
+      await page.goto(u, { waitUntil: "domcontentloaded", timeout: 90000 });
+      await dismissBanners(page);
+      trace.push({ step: "goto", url: page.url(), title: await page.title().catch(() => ""), target: u });
 
-        // If we’re on creator-home, click Create → Text
-        if (/creator-home/.test(page.url())) {
-          const clicked = await clickFirstVisible(page, [
-            page.getByRole("button", { name: /create/i }).first(),
-            page.getByRole("link", { name: /create/i }).first(),
-            page.locator('[data-testid="create-post-button"]').first(),
+      if (/\/login/.test(page.url())) continue;
+
+      if (/creator-home/.test(page.url())) {
+        const clicked = await clickFirstVisible(page, [
+          page.getByRole("button", { name: /create/i }).first(),
+          page.getByRole("link", { name: /create/i }).first(),
+          page.locator('[data-testid="create-post-button"]').first(),
+        ]);
+        trace.push({ step: "creator-home-click", clicked });
+        if (clicked) {
+          await clickFirstVisible(page, [
+            page.getByRole("button", { name: /^text$/i }).first(),
+            page.getByRole("link", { name: /^text$/i }).first(),
+            page.locator('[data-testid="post-type-text"]').first(),
           ]);
-          if (clicked) {
-            await clickFirstVisible(page, [
-              page.getByRole("button", { name: /^text$/i }).first(),
-              page.getByRole("link", { name: /^text$/i }).first(),
-              page.locator('[data-testid="post-type-text"]').first(),
-            ]);
-          }
+          trace.push({ step: "creator-home-select-text" });
         }
+      }
 
-        await page.waitForTimeout(1200);
-        const probe = await findEditor(page);
-        if (probe.title || probe.body) {
-          landed = true;
-          break;
-        }
-      } catch {}
+      await page.waitForTimeout(1200);
+      const probe = await findEditor(page);
+      const seen = { hasTitle: !!probe.title, hasBody: !!probe.body };
+      trace.push({ step: "probe", url: page.url(), title: await page.title().catch(() => ""), seen });
+      if (probe.title || probe.body) { landed = true; break; }
     }
 
-    if (!landed) {
-      throw new Error(
-        `Editor not found after navigation. At: ${page.url()} [${await page.title().catch(
-          () => ""
-        )}]`
-      );
+    res.json({ landed, trace });
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message || e), trace });
+  } finally {
+    try { await browser?.close(); } catch {}
+  }
+});
+
+// ===== CREATE POST =====
+let busy = false;
+
+async function createPostOnce({ title, content, visibility }, trace) {
+  const browser = await launchBrowser();
+  const context = await newContext(browser);
+  context.setDefaultTimeout(90000);
+  await applySessionCookie(context);
+  const page = await context.newPage();
+
+  try {
+    await page.goto("https://www.patreon.com/home", { waitUntil: "domcontentloaded", timeout: 90000 });
+    await dismissBanners(page);
+    trace.push({ step: "home", url: page.url(), title: await page.title().catch(() => "") });
+
+    const looksLogin = /\/login/.test(page.url());
+    if (looksLogin && EMAIL && PASSWORD) {
+      await page.goto("https://www.patreon.com/login", { waitUntil: "domcontentloaded", timeout: 90000 });
+      await dismissBanners(page);
+      await page.fill('input[type="email"]', EMAIL);
+      await page.fill('input[type="password"]', PASSWORD);
+      await Promise.all([page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 90000 }), page.click('button[type="submit"]')]);
+      trace.push({ step: "email-login", url: page.url(), title: await page.title().catch(() => "") });
     }
 
-    // Find editor (again on the final page)
+    const targets = [
+      CAMPAIGN_ID ? `https://www.patreon.com/posts/new?type=text&campaign_id=${encodeURIComponent(CAMPAIGN_ID)}` : null,
+      "https://www.patreon.com/creator-home",
+      "https://www.patreon.com/posts/new?type=text",
+      "https://www.patreon.com/posts/new",
+    ].filter(Boolean);
+
+    let landed = false;
+    for (const u of targets) {
+      await page.goto(u, { waitUntil: "domcontentloaded", timeout: 90000 });
+      await dismissBanners(page);
+      trace.push({ step: "goto", target: u, url: page.url(), title: await page.title().catch(() => "") });
+
+      if (/\/login/.test(page.url())) continue;
+
+      if (/creator-home/.test(page.url())) {
+        const clicked = await clickFirstVisible(page, [
+          page.getByRole("button", { name: /create/i }).first(),
+          page.getByRole("link", { name: /create/i }).first(),
+          page.locator('[data-testid="create-post-button"]').first(),
+        ]);
+        trace.push({ step: "creator-home-click", clicked });
+        if (clicked) {
+          await clickFirstVisible(page, [
+            page.getByRole("button", { name: /^text$/i }).first(),
+            page.getByRole("link", { name: /^text$/i }).first(),
+            page.locator('[data-testid="post-type-text"]').first(),
+          ]);
+          trace.push({ step: "creator-home-select-text" });
+        }
+      }
+
+      await page.waitForTimeout(1200);
+      const probe = await findEditor(page);
+      const seen = { hasTitle: !!probe.title, hasBody: !!probe.body };
+      trace.push({ step: "probe", url: page.url(), title: await page.title().catch(() => ""), seen });
+      if (probe.title || probe.body) { landed = true; break; }
+    }
+
+    if (!landed) throw new Error("Editor not found after navigation");
+
     const editor = await findEditor(page);
-    if (!editor.title && !editor.body)
-      throw new Error(`Editor not found at ${page.url()} [${await page.title().catch(() => "")}]`);
-
-    // Fill title
-    if (editor.title) {
-      await editor.title.click();
-      await page.keyboard.type(title);
-    }
-
-    // Fill body
+    if (editor.title) { await editor.title.click(); await page.keyboard.type(title); }
     const body =
       editor.body && (await editor.body.isVisible().catch(() => false))
         ? editor.body
         : page.locator('div[contenteditable="true"]').first();
-    if (await body.isVisible().catch(() => false)) {
-      await body.click();
-      await page.keyboard.type(content);
-    }
+    if (await body.isVisible().catch(() => false)) { await body.click(); await page.keyboard.type(content); }
 
-    // Visibility (simple attempt; UI varies)
     if (/public/i.test(visibility)) {
       const visBtn = page.getByRole("button", { name: /public|patrons|members/i }).first();
       if (await visBtn.isVisible().catch(() => false)) {
@@ -309,7 +312,6 @@ async function createPostOnce({ title, content, visibility }) {
       }
     }
 
-    // Publish
     const publish = page.getByRole("button", { name: /publish/i }).first();
     const postBtn = page.getByRole("button", { name: /^post$/i }).first();
     if (await publish.isVisible().catch(() => false)) {
@@ -321,6 +323,7 @@ async function createPostOnce({ title, content, visibility }) {
     }
 
     await page.waitForURL(/patreon\.com\/posts\//, { timeout: 120000 });
+    trace.push({ step: "posted", url: page.url(), title: await page.title().catch(() => "") });
     return { patreonUrl: page.url() };
   } finally {
     try { await browser.close(); } catch {}
@@ -330,31 +333,28 @@ async function createPostOnce({ title, content, visibility }) {
 app.post("/create-patreon-post", async (req, res) => {
   if (busy) return res.status(429).json({ error: "Busy, try again in a few seconds." });
   busy = true;
-
+  const trace = [];
   const { title, content, visibility = "patrons" } = req.body || {};
   if (!title || !content) {
     busy = false;
     return res.status(400).json({ error: "title and content required" });
   }
-
   try {
-    await new Promise((r) => setTimeout(r, 200)); // tiny warmup
     try {
-      const out = await createPostOnce({ title, content, visibility });
-      busy = false;
-      return res.json(out);
+      const out = await createPostOnce({ title, content, visibility }, trace);
+      busy = false; return res.json(out);
     } catch (e1) {
-      await new Promise((r) => setTimeout(r, 1500)); // retry once
-      const out2 = await createPostOnce({ title, content, visibility });
-      busy = false;
-      return res.json(out2);
+      trace.push({ retrying: true, err: String(e1?.message || e1) });
+      await new Promise(r => setTimeout(r, 1200));
+      const out2 = await createPostOnce({ title, content, visibility }, trace);
+      busy = false; return res.json(out2);
     }
   } catch (e) {
     busy = false;
-    return res.status(500).json({ error: String(e?.message || e) });
+    return res.status(500).json({ error: String(e?.message || e), trace });
   }
 });
 
-// ===== SERVER =====
-const port = process.env.PORT || 8080;
-app.listen(port, () => console.log(`patreon-poster listening on :${port}`));
+app.get("/warmup", (_req, res) => res.json({ ok: true, ts: Date.now() }));
+
+app.listen(PORT, () => console.log(`patreon-poster listening on :${PORT}`));
