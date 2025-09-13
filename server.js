@@ -1,17 +1,18 @@
-// server.js
+// server.js — full replacement
 import express from "express";
 import { chromium } from "playwright";
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-// ---------- ENV ----------
+// ===== ENV =====
 const SESSION_COOKIE =
   process.env.PATREON_SESSION_COOKIE || process.env.PATREON_COOKIE || "";
 const EMAIL = process.env.PATREON_EMAIL || "";
-const PASSWORD = process.env.PATREON_PASSWORD || "";
+const PASSWORD = process.env.PATREON_PASSWORD || ""; // only if no 2FA
+const CAMPAIGN_ID = process.env.PATREON_CAMPAIGN_ID || ""; // e.g. "13804237"
 
-// ---------- BROWSER HELPERS ----------
+// ===== BROWSER HELPERS =====
 function launchBrowser() {
   return chromium.launch({
     headless: true,
@@ -49,11 +50,11 @@ async function applySessionCookie(context) {
 async function dismissBanners(page) {
   try {
     const ot = page.locator("#onetrust-accept-btn-handler");
-    if (await ot.isVisible({ timeout: 1000 }).catch(() => false)) await ot.click();
+    if (await ot.isVisible({ timeout: 800 }).catch(() => false)) await ot.click();
   } catch {}
   try {
     const accept = page.getByRole("button", { name: /accept all/i }).first();
-    if (await accept.isVisible({ timeout: 1000 }).catch(() => false)) await accept.click();
+    if (await accept.isVisible({ timeout: 800 }).catch(() => false)) await accept.click();
   } catch {}
 }
 
@@ -85,7 +86,7 @@ async function findEditor(page) {
     'div[role="textbox"][data-slate-editor="true"]',
   ];
 
-  // Try main page
+  // main frame
   for (const t of titleSel) {
     const tl = page.locator(t).first();
     if (await tl.isVisible().catch(() => false)) {
@@ -96,7 +97,7 @@ async function findEditor(page) {
       return { title: tl, body: null };
     }
   }
-  // Try iframes
+  // iframes
   for (const f of page.frames()) {
     for (const t of titleSel) {
       const tl = f.locator(t).first();
@@ -112,7 +113,7 @@ async function findEditor(page) {
   return { title: null, body: null };
 }
 
-// ---------- DEBUG: are we logged in? ----------
+// ===== DEBUG ROUTES =====
 app.get("/debug-auth", async (_req, res) => {
   let browser;
   try {
@@ -124,7 +125,7 @@ app.get("/debug-auth", async (_req, res) => {
     await page.goto("https://www.patreon.com/home", { waitUntil: "domcontentloaded", timeout: 60000 });
     await dismissBanners(page);
     const currentUrl = page.url();
-    const title = await page.title();
+    const title = await page.title().catch(() => "");
     const loggedIn = !/\/login/.test(currentUrl) && !/log in/i.test(title);
     res.json({ loggedIn, currentUrl, title, hasCookie: !!SESSION_COOKIE });
   } catch (e) {
@@ -134,30 +135,56 @@ app.get("/debug-auth", async (_req, res) => {
   }
 });
 
-// ---------- DEBUG: prove cookie is loaded & applied ----------
+app.get("/debug-cookie-load-lite", (req, res) => {
+  try {
+    const raw = SESSION_COOKIE;
+    const envPreview = raw ? `${raw.slice(0, 48)}...(${raw.length})` : "";
+    const pairs = raw.split(";").map((s) => s.trim()).filter(Boolean);
+    const names = pairs
+      .map((kv) => {
+        const i = kv.indexOf("="); if (i < 0) return null;
+        return kv.slice(0, i).trim();
+      })
+      .filter(Boolean);
+    res.json({
+      hasEnv: !!raw,
+      envPreview,
+      parsedCookieNames: names.slice(0, 30),
+      parsedCount: names.length,
+      note: "No browser launched here; only env parsing.",
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message || e) });
+  }
+});
+
 app.get("/debug-cookie-load", async (_req, res) => {
   let browser;
   try {
-    const masked = SESSION_COOKIE
-      ? `${SESSION_COOKIE.slice(0, 32)}...(${SESSION_COOKIE.length})`
-      : "";
-    browser = await launchBrowser();
+    const raw = SESSION_COOKIE;
+    const envPreview = raw ? `${raw.slice(0, 48)}...(${raw.length})` : "";
+
+    browser = await chromium.launch({
+      headless: true,
+      args: ["--no-sandbox", "--disable-dev-shm-usage"],
+      timeout: 45000,
+    });
     const context = await newContext(browser);
     const { added } = await applySessionCookie(context);
-    const applied = (await context.cookies("https://www.patreon.com")).map((c) => ({
-      name: c.name,
-      domain: c.domain,
-    }));
+    const applied = await context.cookies("https://www.patreon.com").catch(() => []);
+    const cookiesApplied = (applied || []).slice(0, 30).map((c) => ({ name: c.name, domain: c.domain }));
+
     const page = await context.newPage();
-    await page.goto("https://www.patreon.com/home", { waitUntil: "domcontentloaded", timeout: 60000 });
+    await page.goto("https://www.patreon.com/home", { waitUntil: "domcontentloaded", timeout: 45000 });
     const currentUrl = page.url();
-    const title = await page.title();
+    const title = await page.title().catch(() => "");
+
     res.json({
-      hasEnv: !!SESSION_COOKIE,
-      envPreview: masked,
+      hasEnv: !!raw,
+      envPreview,
       cookiesAddedFromEnv: added,
-      cookiesAppliedCount: applied.length,
-      cookiesApplied: applied,
+      cookiesAppliedCount: applied?.length || 0,
+      cookiesApplied,
       currentUrl,
       title,
     });
@@ -170,7 +197,7 @@ app.get("/debug-cookie-load", async (_req, res) => {
 
 app.get("/warmup", (_req, res) => res.json({ ok: true, ts: Date.now() }));
 
-// ---------- CORE: create post ----------
+// ===== CORE: CREATE POST =====
 let busy = false;
 
 async function createPostOnce({ title, content, visibility }) {
@@ -181,14 +208,14 @@ async function createPostOnce({ title, content, visibility }) {
   const page = await context.newPage();
 
   try {
-    // Open home (or login)
+    // Go home, dismiss modals
     await page.goto("https://www.patreon.com/home", { waitUntil: "domcontentloaded", timeout: 90000 });
     await dismissBanners(page);
 
-    // If logged out and EMAIL/PASSWORD provided, try email login (no 2FA)
-    const onLogin =
+    // If we see login and creds provided, attempt email login (no 2FA)
+    const looksLogin =
       /\/login/.test(page.url()) || /log in/i.test(await page.title().catch(() => ""));
-    if (onLogin && EMAIL && PASSWORD) {
+    if (looksLogin && EMAIL && PASSWORD) {
       await page.goto("https://www.patreon.com/login", { waitUntil: "domcontentloaded", timeout: 90000 });
       await dismissBanners(page);
       await page.fill('input[type="email"]', EMAIL, { timeout: 60000 });
@@ -199,62 +226,80 @@ async function createPostOnce({ title, content, visibility }) {
       ]);
     }
 
-    // Navigate to composer
-    await page.goto("https://www.patreon.com/home", { waitUntil: "domcontentloaded", timeout: 90000 });
-    await dismissBanners(page);
+    // === Campaign-aware composer navigation ===
+    const targets = [
+      CAMPAIGN_ID
+        ? `https://www.patreon.com/posts/new?type=text&campaign_id=${encodeURIComponent(
+            CAMPAIGN_ID
+          )}`
+        : null,
+      "https://www.patreon.com/creator-home",
+      "https://www.patreon.com/posts/new?type=text",
+      "https://www.patreon.com/posts/new",
+    ].filter(Boolean);
 
-    const clicked = await clickFirstVisible(page, [
-      page.getByRole("button", { name: /create/i }).first(),
-      page.getByRole("link", { name: /create/i }).first(),
-      page.locator('[data-testid="create-post-button"]').first(),
-      page.locator('a[href*="/posts/new"]').first(),
-    ]);
-    if (!clicked) {
-      let landed = false;
-      for (const u of [
-        "https://www.patreon.com/posts/new?type=text",
-        "https://www.patreon.com/posts/new",
-      ]) {
-        try {
-          await page.goto(u, { waitUntil: "domcontentloaded", timeout: 90000 });
-          await dismissBanners(page);
+    let landed = false;
+    for (const u of targets) {
+      try {
+        await page.goto(u, { waitUntil: "domcontentloaded", timeout: 90000 });
+        await dismissBanners(page);
+        if (/\/login/.test(page.url())) continue; // bounced → try next
+
+        // If we’re on creator-home, click Create → Text
+        if (/creator-home/.test(page.url())) {
+          const clicked = await clickFirstVisible(page, [
+            page.getByRole("button", { name: /create/i }).first(),
+            page.getByRole("link", { name: /create/i }).first(),
+            page.locator('[data-testid="create-post-button"]').first(),
+          ]);
+          if (clicked) {
+            await clickFirstVisible(page, [
+              page.getByRole("button", { name: /^text$/i }).first(),
+              page.getByRole("link", { name: /^text$/i }).first(),
+              page.locator('[data-testid="post-type-text"]').first(),
+            ]);
+          }
+        }
+
+        await page.waitForTimeout(1200);
+        const probe = await findEditor(page);
+        if (probe.title || probe.body) {
           landed = true;
           break;
-        } catch {}
-      }
-      if (!landed) {
-        throw new Error(`Could not reach composer. At: ${page.url()} [${await page.title().catch(() => "")}]`);
-      }
-    } else {
-      await clickFirstVisible(page, [
-        page.getByRole("button", { name: /^text$/i }).first(),
-        page.getByRole("link", { name: /^text$/i }).first(),
-        page.locator('[data-testid="post-type-text"]').first(),
-      ]);
+        }
+      } catch {}
     }
 
-    // Editor
-    await page.waitForTimeout(1200);
+    if (!landed) {
+      throw new Error(
+        `Editor not found after navigation. At: ${page.url()} [${await page.title().catch(
+          () => ""
+        )}]`
+      );
+    }
+
+    // Find editor (again on the final page)
     const editor = await findEditor(page);
-    if (!editor.title && !editor.body) {
+    if (!editor.title && !editor.body)
       throw new Error(`Editor not found at ${page.url()} [${await page.title().catch(() => "")}]`);
-    }
 
+    // Fill title
     if (editor.title) {
       await editor.title.click();
       await page.keyboard.type(title);
     }
 
+    // Fill body
     const body =
       editor.body && (await editor.body.isVisible().catch(() => false))
         ? editor.body
         : page.locator('div[contenteditable="true"]').first();
-
     if (await body.isVisible().catch(() => false)) {
       await body.click();
       await page.keyboard.type(content);
     }
 
+    // Visibility (simple attempt; UI varies)
     if (/public/i.test(visibility)) {
       const visBtn = page.getByRole("button", { name: /public|patrons|members/i }).first();
       if (await visBtn.isVisible().catch(() => false)) {
@@ -264,6 +309,7 @@ async function createPostOnce({ title, content, visibility }) {
       }
     }
 
+    // Publish
     const publish = page.getByRole("button", { name: /publish/i }).first();
     const postBtn = page.getByRole("button", { name: /^post$/i }).first();
     if (await publish.isVisible().catch(() => false)) {
@@ -292,14 +338,13 @@ app.post("/create-patreon-post", async (req, res) => {
   }
 
   try {
-    await new Promise((r) => setTimeout(r, 250)); // small warmup
+    await new Promise((r) => setTimeout(r, 200)); // tiny warmup
     try {
       const out = await createPostOnce({ title, content, visibility });
       busy = false;
       return res.json(out);
     } catch (e1) {
-      // retry once
-      await new Promise((r) => setTimeout(r, 1500));
+      await new Promise((r) => setTimeout(r, 1500)); // retry once
       const out2 = await createPostOnce({ title, content, visibility });
       busy = false;
       return res.json(out2);
@@ -310,6 +355,6 @@ app.post("/create-patreon-post", async (req, res) => {
   }
 });
 
-// ---------- SERVER ----------
+// ===== SERVER =====
 const port = process.env.PORT || 8080;
 app.listen(port, () => console.log(`patreon-poster listening on :${port}`));
