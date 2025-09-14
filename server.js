@@ -1,4 +1,4 @@
-// server.js (diagnostic build)
+// server.js — full replacement (supports /posts/{id}/edit)
 import express from "express";
 import { chromium } from "playwright";
 
@@ -10,7 +10,8 @@ const RAW_COOKIE =
   process.env.PATREON_SESSION_COOKIE || process.env.PATREON_COOKIE || "";
 const EMAIL = process.env.PATREON_EMAIL || "";
 const PASSWORD = process.env.PATREON_PASSWORD || ""; // only if no 2FA
-const CAMPAIGN_ID = process.env.PATREON_CAMPAIGN_ID || ""; // e.g. "13804237"
+const CAMPAIGN_ID = process.env.PATREON_CAMPAIGN_ID || ""; // e.g. "55146412"
+const COMPOSER_URL = process.env.PATREON_COMPOSER_URL || ""; // e.g. "https://www.patreon.com/posts/138897888/edit"
 const PORT = process.env.PORT || 8080;
 
 const UA =
@@ -30,7 +31,7 @@ function newContext(browser) {
   });
 }
 
-// --- apply cookie to BOTH domains (critical)
+// apply cookie to BOTH apex + www domains
 async function applySessionCookie(context) {
   if (!RAW_COOKIE) return { added: 0, names: [] };
   const pairs = RAW_COOKIE.split(";").map((s) => s.trim()).filter(Boolean);
@@ -42,7 +43,6 @@ async function applySessionCookie(context) {
     const name = kv.slice(0, i).trim();
     const value = kv.slice(i + 1).trim();
     names.push(name);
-    // set for both apex + www
     cookies.push({ name, value, domain: ".patreon.com", path: "/" });
     cookies.push({ name, value, domain: "www.patreon.com", path: "/" });
   }
@@ -114,13 +114,14 @@ async function findEditor(page) {
   return { title: null, body: null };
 }
 
-// ===== DEBUG ROUTES =====
+// ===== DEBUG =====
 app.get("/diag", (_req, res) => {
   const preview = RAW_COOKIE ? `${RAW_COOKIE.slice(0, 48)}...(${RAW_COOKIE.length})` : "";
   res.json({
     hasCookieEnv: !!RAW_COOKIE,
     cookiePreview: preview,
     campaignId: CAMPAIGN_ID || null,
+    composerUrl: COMPOSER_URL || null,
   });
 });
 
@@ -128,17 +129,9 @@ app.get("/debug-cookie-load-lite", (_req, res) => {
   try {
     const preview = RAW_COOKIE ? `${RAW_COOKIE.slice(0, 48)}...(${RAW_COOKIE.length})` : "";
     const names = RAW_COOKIE
-      ? RAW_COOKIE.split(";")
-          .map((s) => s.trim())
-          .filter(Boolean)
-          .map((kv) => kv.slice(0, kv.indexOf("=")).trim())
+      ? RAW_COOKIE.split(";").map((s) => s.trim()).filter(Boolean).map((kv) => kv.slice(0, kv.indexOf("=")).trim())
       : [];
-    res.json({
-      hasEnv: !!RAW_COOKIE,
-      envPreview: preview,
-      parsedCookieNames: names,
-      parsedCount: names.length,
-    });
+    res.json({ hasEnv: !!RAW_COOKIE, envPreview: preview, parsedCookieNames: names, parsedCount: names.length });
   } catch (e) {
     res.status(500).json({ error: String(e?.message || e) });
   }
@@ -166,11 +159,14 @@ app.get("/debug-auth", async (_req, res) => {
   }
 });
 
-// Try composer only (no post)
-app.get("/try-composer", async (_req, res) => {
+// Try composer (supports ?campaign= and ?url= overrides)
+app.get("/try-composer", async (req, res) => {
   let browser;
   const trace = [];
   try {
+    const urlOverride = req.query.url || COMPOSER_URL || null;
+    const campaignOverride = req.query.campaign || CAMPAIGN_ID || null;
+
     browser = await launchBrowser();
     const context = await newContext(browser);
     await applySessionCookie(context);
@@ -181,9 +177,10 @@ app.get("/try-composer", async (_req, res) => {
     await dismissBanners(page);
     trace.push({ step: "home", url: page.url(), title: await page.title().catch(() => "") });
 
-    // targets
+    // targets (priority: explicit URL, then campaign composer, then creator-home, then generic)
     const targets = [
-      CAMPAIGN_ID ? `https://www.patreon.com/posts/new?type=text&campaign_id=${encodeURIComponent(CAMPAIGN_ID)}` : null,
+      urlOverride,
+      campaignOverride ? `https://www.patreon.com/posts/new?type=text&campaign_id=${encodeURIComponent(campaignOverride)}` : null,
       "https://www.patreon.com/creator-home",
       "https://www.patreon.com/posts/new?type=text",
       "https://www.patreon.com/posts/new",
@@ -193,7 +190,7 @@ app.get("/try-composer", async (_req, res) => {
     for (const u of targets) {
       await page.goto(u, { waitUntil: "domcontentloaded", timeout: 90000 });
       await dismissBanners(page);
-      trace.push({ step: "goto", url: page.url(), title: await page.title().catch(() => ""), target: u });
+      trace.push({ step: "goto", target: u, url: page.url(), title: await page.title().catch(() => "") });
 
       if (/\/login/.test(page.url())) continue;
 
@@ -232,7 +229,7 @@ app.get("/try-composer", async (_req, res) => {
 // ===== CREATE POST =====
 let busy = false;
 
-async function createPostOnce({ title, content, visibility }, trace) {
+async function createPostOnce({ title, content, visibility, urlOverride, campaignOverride }, trace) {
   const browser = await launchBrowser();
   const context = await newContext(browser);
   context.setDefaultTimeout(90000);
@@ -248,14 +245,15 @@ async function createPostOnce({ title, content, visibility }, trace) {
     if (looksLogin && EMAIL && PASSWORD) {
       await page.goto("https://www.patreon.com/login", { waitUntil: "domcontentloaded", timeout: 90000 });
       await dismissBanners(page);
-      await page.fill('input[type="email"]', EMAIL);
-      await page.fill('input[type="password"]', PASSWORD);
+      await page.fill('input[type="email"]', EMAIL, { timeout: 60000 });
+      await page.fill('input[type="password"]', PASSWORD, { timeout: 60000 });
       await Promise.all([page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 90000 }), page.click('button[type="submit"]')]);
       trace.push({ step: "email-login", url: page.url(), title: await page.title().catch(() => "") });
     }
 
     const targets = [
-      CAMPAIGN_ID ? `https://www.patreon.com/posts/new?type=text&campaign_id=${encodeURIComponent(CAMPAIGN_ID)}` : null,
+      urlOverride || COMPOSER_URL || null,
+      (campaignOverride || CAMPAIGN_ID) ? `https://www.patreon.com/posts/new?type=text&campaign_id=${encodeURIComponent(campaignOverride || CAMPAIGN_ID)}` : null,
       "https://www.patreon.com/creator-home",
       "https://www.patreon.com/posts/new?type=text",
       "https://www.patreon.com/posts/new",
@@ -297,10 +295,9 @@ async function createPostOnce({ title, content, visibility }, trace) {
 
     const editor = await findEditor(page);
     if (editor.title) { await editor.title.click(); await page.keyboard.type(title); }
-    const body =
-      editor.body && (await editor.body.isVisible().catch(() => false))
-        ? editor.body
-        : page.locator('div[contenteditable="true"]').first();
+    const body = editor.body && (await editor.body.isVisible().catch(() => false))
+      ? editor.body
+      : page.locator('div[contenteditable="true"]').first();
     if (await body.isVisible().catch(() => false)) { await body.click(); await page.keyboard.type(content); }
 
     if (/public/i.test(visibility)) {
@@ -330,23 +327,30 @@ async function createPostOnce({ title, content, visibility }, trace) {
   }
 }
 
+let busy = false;
+
 app.post("/create-patreon-post", async (req, res) => {
   if (busy) return res.status(429).json({ error: "Busy, try again in a few seconds." });
   busy = true;
+
   const trace = [];
-  const { title, content, visibility = "patrons" } = req.body || {};
-  if (!title || !content) {
-    busy = false;
-    return res.status(400).json({ error: "title and content required" });
-  }
+  const { title, content, visibility = "patrons", composerUrl, campaignId } = req.body || {};
+  if (!title || !content) { busy = false; return res.status(400).json({ error: "title and content required" }); }
+
   try {
     try {
-      const out = await createPostOnce({ title, content, visibility }, trace);
+      const out = await createPostOnce(
+        { title, content, visibility, urlOverride: composerUrl || null, campaignOverride: campaignId || null },
+        trace
+      );
       busy = false; return res.json(out);
     } catch (e1) {
       trace.push({ retrying: true, err: String(e1?.message || e1) });
       await new Promise(r => setTimeout(r, 1200));
-      const out2 = await createPostOnce({ title, content, visibility }, trace);
+      const out2 = await createPostOnce(
+        { title, content, visibility, urlOverride: composerUrl || null, campaignOverride: campaignId || null },
+        trace
+      );
       busy = false; return res.json(out2);
     }
   } catch (e) {
