@@ -1,4 +1,4 @@
-// server.js — full replacement (supports /posts/{id}/edit)
+// server.js — fixed: single 'busy' declaration
 import express from "express";
 import { chromium } from "playwright";
 
@@ -172,12 +172,10 @@ app.get("/try-composer", async (req, res) => {
     await applySessionCookie(context);
     const page = await context.newPage();
 
-    // home
     await page.goto("https://www.patreon.com/home", { waitUntil: "domcontentloaded", timeout: 90000 });
     await dismissBanners(page);
     trace.push({ step: "home", url: page.url(), title: await page.title().catch(() => "") });
 
-    // targets (priority: explicit URL, then campaign composer, then creator-home, then generic)
     const targets = [
       urlOverride,
       campaignOverride ? `https://www.patreon.com/posts/new?type=text&campaign_id=${encodeURIComponent(campaignOverride)}` : null,
@@ -227,7 +225,7 @@ app.get("/try-composer", async (req, res) => {
 });
 
 // ===== CREATE POST =====
-let busy = false;
+let busy = false; // <-- single declaration lives here
 
 async function createPostOnce({ title, content, visibility, urlOverride, campaignOverride }, trace) {
   const browser = await launchBrowser();
@@ -326,8 +324,6 @@ async function createPostOnce({ title, content, visibility, urlOverride, campaig
     try { await browser.close(); } catch {}
   }
 }
-
-let busy = false;
 
 app.post("/create-patreon-post", async (req, res) => {
   if (busy) return res.status(429).json({ error: "Busy, try again in a few seconds." });
